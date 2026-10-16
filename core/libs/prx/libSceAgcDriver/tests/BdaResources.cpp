@@ -754,6 +754,208 @@ void importStaleProbeTests(const Context& context, const BdaTestAccess& access) 
     }
 }
 
+#ifdef _WIN32
+struct StaleProbeHook {
+    std::uint64_t trigger = 0;
+    void* unrelated = nullptr;
+    bool* unrelatedMapped = nullptr;
+    bool fired = false;
+};
+
+StaleProbeHook* activeStaleProbeHook = nullptr;
+
+void mutateUnrelatedRegistrationOnFlush(std::uint64_t address, std::size_t) {
+    auto* hook = activeStaleProbeHook;
+    if (hook == nullptr || hook->fired || address != hook->trigger) return;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(hook->unrelated, WindowedRange::piece, true, false, false);
+    }
+    *hook->unrelatedMapped = true;
+    hook->fired = true;
+}
+
+class StaleProbeRanges {
+public:
+    static constexpr std::size_t unrelatedBytes = WindowedRange::piece;
+
+    explicit StaleProbeRanges(const Context& context) : importing(context) {
+        try {
+            setup();
+        } catch (...) {
+            cleanup();
+            throw;
+        }
+    }
+
+    ~StaleProbeRanges() { cleanup(); }
+    StaleProbeRanges(const StaleProbeRanges&) = delete;
+    StaleProbeRanges& operator=(const StaleProbeRanges&) = delete;
+
+    std::uint64_t Root() const { return reinterpret_cast<std::uintptr_t>(block); }
+    std::size_t Whole() const { return 2 * window; }
+    std::uint64_t EarlyRoot() const { return earlyAddress; }
+
+    Context importing;
+    std::byte* block = nullptr;
+    std::byte* unrelated = nullptr;
+    std::uint64_t earlyAddress = 0;
+    std::size_t earlyBytes = 0;
+    std::size_t window = 0;
+    bool unrelatedMapped = false;
+
+private:
+    void setup() {
+        image = GetModuleHandleW(nullptr);
+        Require(image != nullptr, "cannot locate the graphics test image for the stale-probe fixture");
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
+        Require(dos->e_magic == IMAGE_DOS_SIGNATURE, "the graphics test image has no DOS header");
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const std::byte*>(image) + dos->e_lfanew);
+        Require(nt->Signature == IMAGE_NT_SIGNATURE, "the graphics test image has no PE header");
+        const auto imageBegin = reinterpret_cast<std::uintptr_t>(image);
+        const auto imageEnd = imageBegin + nt->OptionalHeader.SizeOfImage;
+
+        bool imageAlreadyRegistered = false;
+        {
+            const auto lease = GuestAllocations::GuestAllocationsAcquireAll_nid_postfix();
+            imageAlreadyRegistered = std::any_of(lease.begin(), lease.end(), [&](const auto& range) {
+                return !range->releasable && range->address >= imageBegin && range->address < imageEnd;
+            });
+        }
+        if (!imageAlreadyRegistered) {
+            GuestAllocations::Mutation mutation;
+            mutation.RegisterImage(image);
+            ownsImage = true;
+        }
+
+        bool foundEarlyRoot = false;
+        {
+            const auto lease = GuestAllocations::GuestAllocationsAcquireAll_nid_postfix();
+            for (const auto& range : lease) {
+                if (range->releasable || !range->readable || range->writable || range->address < imageBegin || range->address >= imageEnd) continue;
+                if (!foundEarlyRoot || range->bytes < earlyBytes) {
+                    earlyAddress = range->address;
+                    earlyBytes = range->bytes;
+                    earlyGpu = range->gpu;
+                    foundEarlyRoot = true;
+                }
+            }
+        }
+        Require(foundEarlyRoot, "the graphics test image has no readable nonwritable image range");
+
+        for (const auto candidate : {std::size_t{65536}, std::size_t{131072}, std::size_t{262144}, std::size_t{524288}, std::size_t{1} << 20u, std::size_t{2} << 20u, std::size_t{4} << 20u, std::size_t{8} << 20u}) {
+            if (earlyAddress % candidate != 0 || earlyBytes % candidate != 0) {
+                window = candidate;
+                break;
+            }
+        }
+        Require(window != 0, "no bounded host-import alignment rejects the image root");
+        importing.hostImportAlignment = window;
+        SetHostImportRangeWindow(window);
+        SetHostImportBudget(0);
+
+        block = static_cast<std::byte*>(allocateAbove(imageEnd, 4 * window, window));
+        unrelated = static_cast<std::byte*>(::operator new(unrelatedBytes, std::align_val_t{unrelatedBytes}));
+        std::memset(block, 0x4d, 4 * window);
+        std::memset(unrelated, 0x29, unrelatedBytes);
+        {
+            GuestAllocations::Mutation mutation;
+            if (!earlyGpu) mutation.Protect(reinterpret_cast<void*>(earlyAddress), earlyBytes, true, false, true, [] {});
+            mutation.Add(block, 2 * window, true, false, true);
+            rootMapped = true;
+        }
+        earlyGpuChanged = !earlyGpu;
+    }
+
+    static std::byte* allocateAbove(std::uintptr_t minimum, std::size_t bytes, std::size_t alignment) {
+        SYSTEM_INFO info{};
+        GetSystemInfo(&info);
+        const auto maximum = reinterpret_cast<std::uintptr_t>(info.lpMaximumApplicationAddress);
+        const auto alignUp = [alignment](std::uintptr_t value) { return (value + alignment - 1) / alignment * alignment; };
+        const auto step = std::max<std::uintptr_t>(std::uintptr_t{64} << 20u, alignment);
+        for (auto candidate = alignUp(minimum + (std::uintptr_t{64} << 20u)); candidate <= maximum - bytes;) {
+            if (auto* result = VirtualAlloc(reinterpret_cast<void*>(candidate), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE); result != nullptr) return static_cast<std::byte*>(result);
+            if (candidate > maximum - bytes - std::min<std::uintptr_t>(step, maximum - bytes)) break;
+            candidate += step;
+        }
+        auto candidate = (maximum - bytes) / alignment * alignment;
+        while (candidate > minimum) {
+            if (auto* result = VirtualAlloc(reinterpret_cast<void*>(candidate), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE); result != nullptr) return static_cast<std::byte*>(result);
+            if (candidate < step) break;
+            candidate -= step;
+        }
+        throw std::runtime_error("cannot reserve a high guest allocation after the image root");
+    }
+
+    void cleanup() noexcept {
+        if (cleaned) return;
+        cleaned = true;
+        try {
+            {
+                GuestAllocations::Mutation mutation;
+                if (unrelatedMapped) mutation.Remove(unrelated);
+                if (rootMapped) mutation.Remove(block);
+                if (ownsImage) mutation.UnregisterImage(image);
+                else if (earlyGpuChanged) mutation.Protect(reinterpret_cast<void*>(earlyAddress), earlyBytes, true, false, earlyGpu, [] {});
+            }
+        } catch (...) {
+        }
+        try { ClearHostImports(importing.device); } catch (...) {}
+        SetHostImportBudget(0);
+        SetHostImportRangeWindow(std::uint64_t{64} << 20u);
+        if (unrelated != nullptr) ::operator delete(unrelated, std::align_val_t{unrelatedBytes});
+        if (block != nullptr) VirtualFree(block, 0, MEM_RELEASE);
+    }
+
+    void* image = nullptr;
+    bool earlyGpu = false;
+    bool earlyGpuChanged = false;
+    bool ownsImage = false;
+    bool rootMapped = false;
+    bool cleaned = false;
+};
+#endif
+
+void staleProbeAcquireRegisteredTests(const Context& context) {
+#ifdef _WIN32
+    StaleProbeRanges ranges(context);
+    const auto root = ranges.Root();
+    const auto large = ranges.Whole();
+    const auto* firstWindow = HostImportFor(ranges.importing, root + 16, 32);
+    Require(firstWindow != nullptr && firstWindow->base == root && firstWindow->bytes == ranges.window, "the pre-build first window of the large range was not imported");
+    Require(HostImportSerial(ranges.importing, root + 16, 32, false) != 0, "the pre-build import window has no identity");
+
+    StaleProbeHook hook{ranges.EarlyRoot(), ranges.unrelated, &ranges.unrelatedMapped};
+    struct FlushHookReset {
+        ~FlushHookReset() {
+            AgcDriver::GuestMemory::SetFlushHook(nullptr);
+            activeStaleProbeHook = nullptr;
+        }
+    } reset;
+    activeStaleProbeHook = &hook;
+    AgcDriver::GuestMemory::SetFlushHook(&mutateUnrelatedRegistrationOnFlush);
+    {
+        GuestBufferMemory leased(ranges.importing);
+        leased.AcquireRegistered();
+        Require(hook.fired && ranges.unrelatedMapped, "the image-mirror read did not mutate an unrelated registration before the large range was imported");
+        const auto* whole = HostImportFor(ranges.importing, root, large);
+        Require(whole != nullptr && whole->base == root && whole->bytes == large, "a rejected stale window probe made its own whole-range replacement look held");
+        leased.Upload(true);
+        std::uint32_t adjustment = 0;
+        const auto view = leased.Descriptor(root + large - WindowedRange::piece + 16, 32, adjustment);
+        Require(view.range == 32 + adjustment, "a view in the last window of the large range has no descriptor");
+        const auto addressRanges = leased.AddressRanges();
+        Require(std::any_of(addressRanges.begin(), addressRanges.end(), [&](const auto& range) { return range.begin == root && range.end == root + large; }), "the full registered root is absent from the BDA address ranges");
+        leased.WriteBack();
+    }
+    AgcDriver::GuestMemory::SetFlushHook(nullptr);
+    activeStaleProbeHook = nullptr;
+#else
+    static_cast<void>(context);
+    std::cout << "stale-probe AcquireRegistered case requires the Windows native image mapper: not tested\n";
+#endif
+}
+
 // An address-based build whose whole-range import does not fit the budget leaves the range's window alone: before,
 // every such build retired the window and the next access imported it again.
 void importRefusedWholeRangeTests(const Context& context) {
@@ -1934,6 +2136,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     importJoinTests(context);
     importWholeRangeOverWindowTests(context);
     importStaleProbeTests(context, access);
+    staleProbeAcquireRegisteredTests(context);
     importRefusedWholeRangeTests(context);
     importNeighbouringEdgesTests(context);
     importAtMapOverBudgetTests(context);
