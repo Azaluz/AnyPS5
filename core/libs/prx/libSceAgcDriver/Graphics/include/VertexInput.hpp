@@ -14,6 +14,9 @@
 #include <span>
 #include <utility>
 #include <vector>
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h>
+#endif
 
 namespace AgcDriver::Graphics {
 
@@ -437,7 +440,7 @@ inline std::optional<DrawIndexBounds> ClampDrawIndices(std::span<std::byte> indi
 }
 
 template <typename TIndex>
-std::optional<DrawIndexBounds> DrawIndexBoundsOf(std::span<const std::byte> indices, bool skipRestart) {
+std::optional<DrawIndexBounds> DrawIndexBoundsScalar(std::span<const std::byte> indices, bool skipRestart) {
     constexpr auto restartIndex = std::numeric_limits<TIndex>::max();
     const auto count = indices.size() / sizeof(TIndex);
     const auto* data = indices.data();
@@ -464,6 +467,276 @@ std::optional<DrawIndexBounds> DrawIndexBoundsOf(std::span<const std::byte> indi
     }
     if (kept == 0) return std::nullopt;
     return DrawIndexBounds{lowest, highest};
+}
+
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+#define APS5_TARGET_AVX2 __attribute__((target("avx2")))
+#define APS5_TARGET_SSE41 __attribute__((target("sse4.1")))
+
+inline bool HasAvx2() {
+    static const bool supported = [] {
+        __builtin_cpu_init();
+        return __builtin_cpu_supports("avx2") != 0;
+    }();
+    return supported;
+}
+
+inline bool HasSse41() {
+    static const bool supported = [] {
+        __builtin_cpu_init();
+        return __builtin_cpu_supports("sse4.1") != 0;
+    }();
+    return supported;
+}
+
+APS5_TARGET_AVX2 inline std::optional<DrawIndexBounds> DrawIndexBoundsAvx2_16(std::span<const std::byte> indices, bool skipRestart) {
+    const auto count = indices.size() / sizeof(std::uint16_t);
+    if (count == 0) return std::nullopt;
+    const auto* data = indices.data();
+    const auto chunks = count / 16;
+    std::uint16_t lowest = 0xffff;
+    std::uint16_t highest = 0;
+    bool anyKept = !skipRestart;
+    if (chunks > 0) {
+        __m256i lowestVec = _mm256_set1_epi16(static_cast<short>(0xffff));
+        __m256i highestVec = _mm256_setzero_si256();
+        __m256i keptVec = _mm256_setzero_si256();
+        const __m256i restart = _mm256_set1_epi16(static_cast<short>(0xffff));
+        for (std::size_t c = 0; c < chunks; ++c) {
+            const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + c * 32));
+            if (!skipRestart) {
+                lowestVec = _mm256_min_epu16(lowestVec, v);
+                highestVec = _mm256_max_epu16(highestVec, v);
+            } else {
+                const __m256i isRestart = _mm256_cmpeq_epi16(v, restart);
+                const __m256i valid = _mm256_andnot_si256(isRestart, restart);
+                keptVec = _mm256_or_si256(keptVec, valid);
+                lowestVec = _mm256_min_epu16(lowestVec, v);
+                const __m256i vValid = _mm256_and_si256(v, valid);
+                highestVec = _mm256_max_epu16(highestVec, vValid);
+            }
+        }
+        __m128i lo = _mm256_castsi256_si128(lowestVec);
+        __m128i hi = _mm256_extracti128_si256(lowestVec, 1);
+        __m128i min128 = _mm_min_epu16(lo, hi);
+        min128 = _mm_min_epu16(min128, _mm_srli_si128(min128, 8));
+        min128 = _mm_min_epu16(min128, _mm_srli_si128(min128, 4));
+        min128 = _mm_min_epu16(min128, _mm_srli_si128(min128, 2));
+        lowest = static_cast<std::uint16_t>(_mm_extract_epi16(min128, 0));
+
+        lo = _mm256_castsi256_si128(highestVec);
+        hi = _mm256_extracti128_si256(highestVec, 1);
+        __m128i max128 = _mm_max_epu16(lo, hi);
+        max128 = _mm_max_epu16(max128, _mm_srli_si128(max128, 8));
+        max128 = _mm_max_epu16(max128, _mm_srli_si128(max128, 4));
+        max128 = _mm_max_epu16(max128, _mm_srli_si128(max128, 2));
+        highest = static_cast<std::uint16_t>(_mm_extract_epi16(max128, 0));
+
+        if (skipRestart && _mm256_testz_si256(keptVec, keptVec) == 0) anyKept = true;
+    }
+    for (std::size_t i = chunks * 16; i < count; ++i) {
+        std::uint16_t index;
+        std::memcpy(&index, data + i * sizeof(std::uint16_t), sizeof(std::uint16_t));
+        if (!skipRestart) {
+            lowest = std::min(lowest, index);
+            highest = std::max(highest, index);
+        } else if (index != 0xffff) {
+            lowest = std::min(lowest, index);
+            highest = std::max(highest, index);
+            anyKept = true;
+        }
+    }
+    if (!anyKept) return std::nullopt;
+    return DrawIndexBounds{lowest, highest};
+}
+
+APS5_TARGET_SSE41 inline std::optional<DrawIndexBounds> DrawIndexBoundsSse41_16(std::span<const std::byte> indices, bool skipRestart) {
+    const auto count = indices.size() / sizeof(std::uint16_t);
+    if (count == 0) return std::nullopt;
+    const auto* data = indices.data();
+    const auto chunks = count / 8;
+    std::uint16_t lowest = 0xffff;
+    std::uint16_t highest = 0;
+    bool anyKept = !skipRestart;
+    if (chunks > 0) {
+        __m128i lowestVec = _mm_set1_epi16(static_cast<short>(0xffff));
+        __m128i highestVec = _mm_setzero_si128();
+        __m128i keptVec = _mm_setzero_si128();
+        const __m128i restart = _mm_set1_epi16(static_cast<short>(0xffff));
+        for (std::size_t c = 0; c < chunks; ++c) {
+            const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + c * 16));
+            if (!skipRestart) {
+                lowestVec = _mm_min_epu16(lowestVec, v);
+                highestVec = _mm_max_epu16(highestVec, v);
+            } else {
+                const __m128i isRestart = _mm_cmpeq_epi16(v, restart);
+                const __m128i valid = _mm_andnot_si128(isRestart, restart);
+                keptVec = _mm_or_si128(keptVec, valid);
+                lowestVec = _mm_min_epu16(lowestVec, v);
+                const __m128i vValid = _mm_and_si128(v, valid);
+                highestVec = _mm_max_epu16(highestVec, vValid);
+            }
+        }
+        __m128i min128 = lowestVec;
+        min128 = _mm_min_epu16(min128, _mm_srli_si128(min128, 8));
+        min128 = _mm_min_epu16(min128, _mm_srli_si128(min128, 4));
+        min128 = _mm_min_epu16(min128, _mm_srli_si128(min128, 2));
+        lowest = static_cast<std::uint16_t>(_mm_extract_epi16(min128, 0));
+
+        __m128i max128 = highestVec;
+        max128 = _mm_max_epu16(max128, _mm_srli_si128(max128, 8));
+        max128 = _mm_max_epu16(max128, _mm_srli_si128(max128, 4));
+        max128 = _mm_max_epu16(max128, _mm_srli_si128(max128, 2));
+        highest = static_cast<std::uint16_t>(_mm_extract_epi16(max128, 0));
+
+        if (skipRestart && _mm_testz_si128(keptVec, keptVec) == 0) anyKept = true;
+    }
+    for (std::size_t i = chunks * 8; i < count; ++i) {
+        std::uint16_t index;
+        std::memcpy(&index, data + i * sizeof(std::uint16_t), sizeof(std::uint16_t));
+        if (!skipRestart) {
+            lowest = std::min(lowest, index);
+            highest = std::max(highest, index);
+        } else if (index != 0xffff) {
+            lowest = std::min(lowest, index);
+            highest = std::max(highest, index);
+            anyKept = true;
+        }
+    }
+    if (!anyKept) return std::nullopt;
+    return DrawIndexBounds{lowest, highest};
+}
+
+APS5_TARGET_AVX2 inline std::optional<DrawIndexBounds> DrawIndexBoundsAvx2_32(std::span<const std::byte> indices, bool skipRestart) {
+    const auto count = indices.size() / sizeof(std::uint32_t);
+    if (count == 0) return std::nullopt;
+    const auto* data = indices.data();
+    const auto chunks = count / 8;
+    std::uint32_t lowest = 0xffffffffu;
+    std::uint32_t highest = 0;
+    bool anyKept = !skipRestart;
+    if (chunks > 0) {
+        __m256i lowestVec = _mm256_set1_epi32(static_cast<int>(0xffffffffu));
+        __m256i highestVec = _mm256_setzero_si256();
+        __m256i keptVec = _mm256_setzero_si256();
+        const __m256i restart = _mm256_set1_epi32(static_cast<int>(0xffffffffu));
+        for (std::size_t c = 0; c < chunks; ++c) {
+            const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + c * 32));
+            if (!skipRestart) {
+                lowestVec = _mm256_min_epu32(lowestVec, v);
+                highestVec = _mm256_max_epu32(highestVec, v);
+            } else {
+                const __m256i isRestart = _mm256_cmpeq_epi32(v, restart);
+                const __m256i valid = _mm256_andnot_si256(isRestart, restart);
+                keptVec = _mm256_or_si256(keptVec, valid);
+                lowestVec = _mm256_min_epu32(lowestVec, v);
+                const __m256i vValid = _mm256_and_si256(v, valid);
+                highestVec = _mm256_max_epu32(highestVec, vValid);
+            }
+        }
+        __m128i lo = _mm256_castsi256_si128(lowestVec);
+        __m128i hi = _mm256_extracti128_si256(lowestVec, 1);
+        __m128i min128 = _mm_min_epu32(lo, hi);
+        min128 = _mm_min_epu32(min128, _mm_srli_si128(min128, 8));
+        min128 = _mm_min_epu32(min128, _mm_srli_si128(min128, 4));
+        lowest = static_cast<std::uint32_t>(_mm_cvtsi128_si32(min128));
+
+        lo = _mm256_castsi256_si128(highestVec);
+        hi = _mm256_extracti128_si256(highestVec, 1);
+        __m128i max128 = _mm_max_epu32(lo, hi);
+        max128 = _mm_max_epu32(max128, _mm_srli_si128(max128, 8));
+        max128 = _mm_max_epu32(max128, _mm_srli_si128(max128, 4));
+        highest = static_cast<std::uint32_t>(_mm_cvtsi128_si32(max128));
+
+        if (skipRestart && _mm256_testz_si256(keptVec, keptVec) == 0) anyKept = true;
+    }
+    for (std::size_t i = chunks * 8; i < count; ++i) {
+        std::uint32_t index;
+        std::memcpy(&index, data + i * sizeof(std::uint32_t), sizeof(std::uint32_t));
+        if (!skipRestart) {
+            lowest = std::min(lowest, index);
+            highest = std::max(highest, index);
+        } else if (index != 0xffffffffu) {
+            lowest = std::min(lowest, index);
+            highest = std::max(highest, index);
+            anyKept = true;
+        }
+    }
+    if (!anyKept) return std::nullopt;
+    return DrawIndexBounds{lowest, highest};
+}
+
+APS5_TARGET_SSE41 inline std::optional<DrawIndexBounds> DrawIndexBoundsSse41_32(std::span<const std::byte> indices, bool skipRestart) {
+    const auto count = indices.size() / sizeof(std::uint32_t);
+    if (count == 0) return std::nullopt;
+    const auto* data = indices.data();
+    const auto chunks = count / 4;
+    std::uint32_t lowest = 0xffffffffu;
+    std::uint32_t highest = 0;
+    bool anyKept = !skipRestart;
+    if (chunks > 0) {
+        __m128i lowestVec = _mm_set1_epi32(static_cast<int>(0xffffffffu));
+        __m128i highestVec = _mm_setzero_si128();
+        __m128i keptVec = _mm_setzero_si128();
+        const __m128i restart = _mm_set1_epi32(static_cast<int>(0xffffffffu));
+        for (std::size_t c = 0; c < chunks; ++c) {
+            const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + c * 16));
+            if (!skipRestart) {
+                lowestVec = _mm_min_epu32(lowestVec, v);
+                highestVec = _mm_max_epu32(highestVec, v);
+            } else {
+                const __m128i isRestart = _mm_cmpeq_epi32(v, restart);
+                const __m128i valid = _mm_andnot_si128(isRestart, restart);
+                keptVec = _mm_or_si128(keptVec, valid);
+                lowestVec = _mm_min_epu32(lowestVec, v);
+                const __m128i vValid = _mm_and_si128(v, valid);
+                highestVec = _mm_max_epu32(highestVec, vValid);
+            }
+        }
+        __m128i min128 = lowestVec;
+        min128 = _mm_min_epu32(min128, _mm_srli_si128(min128, 8));
+        min128 = _mm_min_epu32(min128, _mm_srli_si128(min128, 4));
+        lowest = static_cast<std::uint32_t>(_mm_cvtsi128_si32(min128));
+
+        __m128i max128 = highestVec;
+        max128 = _mm_max_epu32(max128, _mm_srli_si128(max128, 8));
+        max128 = _mm_max_epu32(max128, _mm_srli_si128(max128, 4));
+        highest = static_cast<std::uint32_t>(_mm_cvtsi128_si32(max128));
+
+        if (skipRestart && _mm_testz_si128(keptVec, keptVec) == 0) anyKept = true;
+    }
+    for (std::size_t i = chunks * 4; i < count; ++i) {
+        std::uint32_t index;
+        std::memcpy(&index, data + i * sizeof(std::uint32_t), sizeof(std::uint32_t));
+        if (!skipRestart) {
+            lowest = std::min(lowest, index);
+            highest = std::max(highest, index);
+        } else if (index != 0xffffffffu) {
+            lowest = std::min(lowest, index);
+            highest = std::max(highest, index);
+            anyKept = true;
+        }
+    }
+    if (!anyKept) return std::nullopt;
+    return DrawIndexBounds{lowest, highest};
+}
+
+#undef APS5_TARGET_AVX2
+#undef APS5_TARGET_SSE41
+#endif
+
+template <typename TIndex>
+std::optional<DrawIndexBounds> DrawIndexBoundsOf(std::span<const std::byte> indices, bool skipRestart) {
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+    if constexpr (std::is_same_v<TIndex, std::uint16_t>) {
+        if (HasAvx2()) return DrawIndexBoundsAvx2_16(indices, skipRestart);
+        if (HasSse41()) return DrawIndexBoundsSse41_16(indices, skipRestart);
+    } else if constexpr (std::is_same_v<TIndex, std::uint32_t>) {
+        if (HasAvx2()) return DrawIndexBoundsAvx2_32(indices, skipRestart);
+        if (HasSse41()) return DrawIndexBoundsSse41_32(indices, skipRestart);
+    }
+#endif
+    return DrawIndexBoundsScalar<TIndex>(indices, skipRestart);
 }
 
 inline std::optional<DrawIndexBounds> DrawIndexRange(std::span<const std::byte> indices, std::uint32_t indexSize, bool skipRestart) {
