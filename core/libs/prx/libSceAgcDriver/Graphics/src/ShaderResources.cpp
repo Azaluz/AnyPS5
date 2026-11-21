@@ -3077,7 +3077,7 @@ bool LoopGuardEnabled() {
 }
 
 void ShaderResources::noteReusable() {
-    const bool spaceReusable = !htileClear.has_value() && drawBuild && usesBda && bdaReadOnly && !SpaceReuseDisabled() && guestMemory.SpaceOnly() && !guestMemory.HasCopiedWrites() && multisampleSources.empty() && !(bda != nullptr && LoopGuardEnabled());
+    const bool spaceReusable = !htileClear.has_value() && usesBda && bdaReadOnly && !SpaceReuseDisabled() && guestMemory.SpaceOnly() && !guestMemory.HasCopiedWrites() && multisampleSources.empty() && !(bda != nullptr && LoopGuardEnabled());
     // Taken whether or not the object turns out reusable: the lookups' records are this build's.
     captureValidation(spaceReusable);
     reusable = false;
@@ -7066,7 +7066,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedD
         return std::optional<std::vector<MovedBuffer>>{};
     };
     std::vector<MovedBuffer> moved;
-    if (shader.program == nullptr || usesBda) return refuse(MoveRefusal::Shape);
+    if (shader.program == nullptr || (usesBda && !spaceReuse)) return refuse(MoveRefusal::Shape);
     if (_set == VK_NULL_HANDLE) return moved;
     for (const auto& binding : shader.program->bindings) {
         if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
