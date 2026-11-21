@@ -6438,7 +6438,26 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         contentKey = prepared != nullptr && !prepared->key.empty() ? std::move(prepared->key) : DispatchContentKey(shaders[0], context.device);
         auto cached = preparedFind && prepared != nullptr && prepared->cached != nullptr ? std::move(prepared->cached) : state->resourceCache.Find(contentKey);
         if (cached != nullptr) {
-            if (cached->Revalidate(shaders[0])) {
+            bool spaceOk = true;
+            if (cached->SpaceReuse()) {
+                if (auto* active = state->recorder.get(); active != nullptr) {
+                    Graphics::GuestBufferMemory::ReleaseRetainedSpaces(active->Id(), active->CompletedThrough());
+                    static_cast<void>(cached->ReleaseCompletedSpace(active->Id(), active->CompletedThrough()));
+                }
+                if (!cached->SpaceHeld() && !cached->RetakeSpace()) {
+                    spaceOk = false;
+                } else if (!cached->AddressTableGuardCurrent()) {
+                    static_cast<void>(cached->ReleaseSpace());
+                    spaceOk = false;
+                } else {
+                    const auto service = cached->SnapshotsServedInPlace(snapshots);
+                    if (service != Graphics::SnapshotService::Served) {
+                        static_cast<void>(cached->ReleaseSpace());
+                        spaceOk = false;
+                    }
+                }
+            }
+            if (spaceOk && cached->Revalidate(shaders[0])) {
                 bool usable = true;
                 if (DispatchMove() && !exactEntry) {
                     auto& moves = DispatchMoves();
@@ -6470,14 +6489,30 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                     }
                 }
                 if (!usable) {
+                    if (cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
                     contentKey = DispatchContentKey(shaders[0], context.device, false);
                     refusedMove = true;
                     cached = state->resourceCache.Find(contentKey);
-                    if (cached != nullptr && cached->Revalidate(shaders[0])) usable = true;
-                    else if (cached != nullptr) {
-                        state->resourceCache.Remove(contentKey, cached.get());
-                        ++d.cacheInvalidated;
-                        state->recorder->Keep(std::move(cached));
+                    if (cached != nullptr) {
+                        bool fallbackSpaceOk = true;
+                        if (cached->SpaceReuse()) {
+                            if (!cached->SpaceHeld() && !cached->RetakeSpace()) fallbackSpaceOk = false;
+                            else if (!cached->AddressTableGuardCurrent()) {
+                                static_cast<void>(cached->ReleaseSpace());
+                                fallbackSpaceOk = false;
+                            } else if (cached->SnapshotsServedInPlace(snapshots) != Graphics::SnapshotService::Served) {
+                                static_cast<void>(cached->ReleaseSpace());
+                                fallbackSpaceOk = false;
+                            }
+                        }
+                        if (fallbackSpaceOk && cached->Revalidate(shaders[0])) usable = true;
+                        else {
+                            if (cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
+                            state->resourceCache.Remove(contentKey, cached.get());
+                            ++d.cacheInvalidated;
+                            state->recorder->Keep(std::move(cached));
+                            cached.reset();
+                        }
                     }
                 }
                 if (usable) {
@@ -6487,9 +6522,9 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                     ++d.cacheHits;
                 }
             } else {
+                if (cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
                 state->resourceCache.Remove(contentKey, cached.get());
                 ++d.cacheInvalidated;
-                // Off the mutex with its batch, as an evicted entry (insert()).
                 cached->KeepStorageImageBytes(*state->recorder);
                 state->recorder->Keep(std::move(cached));
             }
@@ -6620,13 +6655,18 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
         // finishes the recorder up to that batch's serial. Prints the [address-sync] leases line.
         Graphics::CountLeaseOutcome(false, recorder.Submissions() + 1, !resources->BdaReadOnly());
     }
+    if (resources->SpaceReuse()) {
+        auto slot = std::make_shared<std::shared_ptr<const void>>();
+        recorder.Keep(slot);
+        *slot = resources->ReleaseSpace();
+    }
     if (TraceDispatchIo()) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, resources->Describe().c_str());
     WatchMemory(programAddress);
     // The recipe for the caller's dispatch-cache variant (design_cpu_final M4, rule R3): only an
     // object the resource cache serves under this content key (reusable: no lease, no copied
     // writes, every direct region import- or mirror-served), so a hit's proof is the template's
     // Revalidate and nothing needs completion work.
-    if (recipeOut != nullptr && DispatchRecipes() && cacheable && overlay == nullptr && resources->Reusable() && !resources->NeedsCompletion() && objects != nullptr && !contentKey.empty()) {
+    if (recipeOut != nullptr && DispatchRecipes() && cacheable && overlay == nullptr && resources->Reusable() && !resources->SpaceReuse() && !resources->NeedsCompletion() && objects != nullptr && !contentKey.empty()) {
         auto recipe = std::make_shared<Recipe>();
         recipe->device = state->device;
         recipe->templateRef = resources;
