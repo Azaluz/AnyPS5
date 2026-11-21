@@ -90,6 +90,12 @@ void Driver::accountVariant(const DispatchVariant& variant, bool added) {
 }
 
 void Driver::eraseDispatchEntry(std::unordered_map<std::uint64_t, std::shared_ptr<DispatchEntry>>::iterator it) {
+    if (it == dispatchCache.end()) return;
+    if (it->second->shape != 0) {
+        if (const auto shape = dispatchShapes.find(it->second->shape); shape != dispatchShapes.end() && shape->second == it->first) {
+            dispatchShapes.erase(shape);
+        }
+    }
     for (const auto& variant : it->second->variants) accountVariant(*variant, false);
     dispatchOrder.erase(it->second->order);
     dispatchCache.erase(it);

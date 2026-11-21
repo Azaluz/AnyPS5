@@ -45,7 +45,7 @@ std::vector<ShaderRecompiler::MemoryRegion> Driver::dispatchRegions(std::span<co
     return srtRegions;
 }
 
-void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming, const std::shared_ptr<const PreparedShaderState::UserDataLink>& linking) {
+void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming, const std::shared_ptr<const PreparedShaderState::UserDataLink>& linking, std::span<const std::uint32_t> userData, std::uint64_t shapeKey) {
     if (!noDispatchCache) {
         auto fresh = std::make_shared<DispatchVariant>();
         fresh->compiled = compiledResult;
@@ -53,6 +53,15 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
         fresh->shader = registeredShader;
         fresh->linking = linking;
         fresh->forgetSerial = forgetAtCapture;
+        if (capture != nullptr) {
+            const auto walked = capture->userDataUse.asValue | capture->userDataUse.asBase;
+            auto mask = capture->plan != nullptr && capture->plan->srtPlanComplete ? walked | compiledResult->userDataRegisterReads : ~std::uint64_t{0};
+            if (registeredShader && StageLinksUserDataCallees(*registeredShader, 0)) {
+                mask = ~std::uint64_t{0};
+            }
+            fresh->userDataMask = mask;
+        }
+        if (!userData.empty()) fresh->userData.assign(userData.begin(), userData.end());
 
         const auto srtRegions = dispatchRegions(memory, captured, linking.get());
         std::size_t capturedWords = 0;
@@ -131,18 +140,22 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
             if (found == dispatchCache.end()) {
                 auto created = std::make_shared<DispatchEntry>();
                 created->touched = dispatchCacheHits;
+                created->shape = shapeKey;
                 accountVariant(*fresh, true);
                 created->variants.push_back(std::move(fresh));
                 dispatchOrder.push_front(key);
                 created->order = dispatchOrder.begin();
                 dispatchCache.emplace(key, std::move(created));
+                if (shapeKey != 0) dispatchShapes[shapeKey] = key;
             } else if (found->second != missedEntry && !found->second->variants.empty() && found->second->variants.front()->runs == fresh->runs && SameCapturedWords(found->second->variants.front()->words, found->second->variants.front()->shared, fresh->words, fresh->shared)) {
 
                 attachVariant = found->second->variants.front();
+                if (shapeKey != 0) dispatchShapes[shapeKey] = key;
             } else {
 
                 const auto& old = found->second;
                 auto replacement = std::make_shared<DispatchEntry>();
+                replacement->shape = shapeKey != 0 ? shapeKey : old->shape;
                 replacement->variants.reserve(dispatchVariants());
                 accountVariant(*fresh, true);
                 replacement->variants.push_back(std::move(fresh));
@@ -159,6 +172,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                 replacement->order = old->order;
                 dispatchOrder.splice(dispatchOrder.begin(), dispatchOrder, replacement->order);
                 found->second = std::move(replacement);
+                if (shapeKey != 0) dispatchShapes[shapeKey] = key;
             }
 
             static const bool lru = std::getenv("APS5_NO_DISPATCH_LRU") == nullptr;
@@ -172,6 +186,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                 } else {
                     dispatchCacheEvictions += dispatchCache.size();
                     dispatchCache.clear();
+                    dispatchShapes.clear();
                     dispatchOrder.clear();
                     dispatchCacheVariants = 0;
                     dispatchCacheVariantBytes = 0;

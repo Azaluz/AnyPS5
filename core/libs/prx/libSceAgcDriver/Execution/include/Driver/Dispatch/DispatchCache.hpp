@@ -74,6 +74,7 @@ struct DispatchVariant {
     std::shared_ptr<DispatchVariant> donor;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> shaderDataPatches;
     std::uint64_t userDataMask = ~std::uint64_t{0};
+    std::vector<std::uint32_t> userData;
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
 
     std::shared_ptr<ShaderMemory> memory;
@@ -84,7 +85,7 @@ struct DispatchVariant {
 
 struct DispatchEntry {
     std::vector<std::shared_ptr<DispatchVariant>> variants;
-
+    std::uint64_t shape = 0;
     std::uint64_t touched = 0;
 
     std::list<std::uint64_t>::iterator order;

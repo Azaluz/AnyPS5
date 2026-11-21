@@ -1131,7 +1131,11 @@ SpecializedSpirv buildSpecializedModule(const CompiledShaderArtifact& artifact, 
     auto spirv = InternSpirv(std::move(materialized));
     module->hash = spirv.ContentHash();
     module->spirv = spirv.Weaken();
-    module->specializationId = constants.empty() ? 0u : nextVariantId();
+    std::uint64_t specHash = artifact.variantId * 0x100000001b3ull;
+    for (const auto& c : constants) {
+        specHash = (specHash ^ ((static_cast<std::uint64_t>(c.id) << 32u) | c.value)) * 0x100000001b3ull;
+    }
+    module->specializationId = constants.empty() ? 0u : (specHash ? specHash : 1u);
     return {std::move(module), std::move(spirv)};
 }
 

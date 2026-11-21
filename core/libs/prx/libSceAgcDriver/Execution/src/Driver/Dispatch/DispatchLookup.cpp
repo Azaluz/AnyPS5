@@ -5,7 +5,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering) {
+void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering, std::uint64_t shapeKey, std::span<const std::uint32_t> userData) {
     if (!noDispatchCache) {
 
         static const bool validateUnlocked = std::getenv("APS5_NO_UNLOCKED_VALIDATE") == nullptr;
@@ -13,6 +13,13 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
         ++entryCounters.lookups;
         const auto found = dispatchCache.find(key);
         std::shared_ptr<DispatchEntry> entry = found != dispatchCache.end() ? found->second : nullptr;
+        if (entry == nullptr && shapeKey != 0) {
+            if (const auto shapeFound = dispatchShapes.find(shapeKey); shapeFound != dispatchShapes.end()) {
+                if (const auto shapeEntry = dispatchCache.find(shapeFound->second); shapeEntry != dispatchCache.end()) {
+                    entry = shapeEntry->second;
+                }
+            }
+        }
         if (entry == nullptr) ++entryCounters.absent;
         if (validateUnlocked) cacheLock.unlock();
         phaseTiming.Phase(PhaseLookup);
@@ -39,6 +46,15 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
 
                 for (std::size_t i = 0; i < variants.size(); ++i) {
                     if (variants[i]->registeredViews != nullptr && !CaptureRegisteredViewsCurrent(*variants[i]->registeredViews)) continue;
+                    if (found == dispatchCache.end() && !userData.empty() && !variants[i]->userData.empty()) {
+                        bool usedEqual = true;
+                        for (std::size_t w = 0; w < userData.size() && usedEqual; ++w) {
+                            if (w < variants[i]->userData.size() && userData[w] != variants[i]->userData[w] && (w >= 64u || ((variants[i]->userDataMask >> w) & 1u) != 0)) {
+                                usedEqual = false;
+                            }
+                        }
+                        if (!usedEqual) continue;
+                    }
                     regions.clear();
                     appendEntryRegions(*variants[i], regions);
                     ++compared;

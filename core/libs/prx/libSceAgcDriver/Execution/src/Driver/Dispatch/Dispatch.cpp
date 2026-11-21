@@ -246,29 +246,35 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         ~ProbeScope() { if (active) ShaderRecompiler::SetDebugProbeActive(false); }
     } probeScope{probeThis};
     const bool noDispatchCache = noDispatchCacheEnv || probeThis;
-    std::uint64_t key = 0xcbf29ce484222325ull;
-    const auto mix = [&](std::uint64_t value) {
-        key ^= value;
-        key *= 0x100000001b3ull;
+    std::uint64_t shapeKey = 0xcbf29ce484222325ull;
+    const auto mixShape = [&](std::uint64_t value) {
+        shapeKey ^= value;
+        shapeKey *= 0x100000001b3ull;
     };
-    mix(address);
-    mix(packet[4] & 0x8000u);
-    for (const auto threads : compute.partialThreads) mix(threads);
-    for (const auto word : userData) mix(word);
+    mixShape(address);
+    mixShape(packet[4] & 0x8000u);
+    for (const auto threads : compute.partialThreads) mixShape(threads);
 
     static const bool keyHygiene = std::getenv("APS5_NO_DISPATCH_KEY_HYGIENE") == nullptr;
     if (keyHygiene) {
         for (const auto offset : {0x207u, 0x208u, 0x209u, 0x212u, 0x213u, 0x228u}) {
             const auto found = queue.shader.find(offset);
 
-            mix(found == queue.shader.end() ? (1ull << 32u) : found->second);
+            mixShape(found == queue.shader.end() ? (1ull << 32u) : found->second);
         }
     } else {
         for (const auto& [offset, value] : queue.shader) {
-            mix(offset);
-            mix(value);
+            mixShape(offset);
+            mixShape(value);
         }
     }
+    mixShape(reinterpret_cast<std::uintptr_t>(registeredShader.get()));
+    std::uint64_t key = shapeKey;
+    const auto mix = [&](std::uint64_t value) {
+        key ^= value;
+        key *= 0x100000001b3ull;
+    };
+    for (const auto word : userData) mix(word);
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiledResult;
 
     std::shared_ptr<DispatchVariant> keepVariant;
@@ -320,7 +326,6 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         previous.key = key;
     }
 
-    mix(reinterpret_cast<std::uintptr_t>(registeredShader.get()));
     if (fromAhead && key != ahead.key) {
         fromAhead = false;
         ++groupStats.keyMismatches;
@@ -382,7 +387,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         groupStats.ageMaxMs = std::max(groupStats.ageMaxMs, age);
         phaseTiming.Phase(PhaseLookup);
     } else {
-        lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
+        lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering, shapeKey, userData);
     }
     timing.Mark("lookup_cache");
     std::vector<DrawPipeline::Range> itemWrites;
@@ -465,7 +470,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         if (profile) recompileMs.fetch_add(phaseTiming.Elapsed(), std::memory_order_relaxed);
         phaseTiming.Phase(PhaseRecompile);
-        if (!resolving) insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming, linking);
+        if (!resolving) insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming, linking, userData, shapeKey);
         if (linking != nullptr) linking->AppendRegions(captured);
     }
     const auto* registeredViews = capture != nullptr ? &capture->snapshot.registeredImages : keepVariant != nullptr && keepVariant->registeredViews != nullptr ? keepVariant->registeredViews.get() : nullptr;
