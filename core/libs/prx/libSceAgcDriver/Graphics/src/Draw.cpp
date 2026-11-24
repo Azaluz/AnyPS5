@@ -1435,7 +1435,7 @@ bool DrawRecipes() {
 }
 
 const char* DrawRecipeMissName(DrawRecipeMiss miss) {
-    constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof", "buffers"};
+    constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof", "buffers", "recorder lost"};
     return names[static_cast<std::size_t>(miss)];
 }
 
@@ -1737,6 +1737,7 @@ namespace {
 struct DrawInputs {
     // An empty auto draw: nothing to record.
     bool nothing = false;
+    bool recorderLost = false;
     std::uint64_t indexBytes = 0;
     std::shared_ptr<Buffer> indices;
     VkBuffer indexHandle = VK_NULL_HANDLE;
@@ -1917,7 +1918,7 @@ void requireDrawPlanRepeats(const Context& context, const State& state, const Pm
     Require(again.nothing == plan.nothing && again.indexBytes == plan.indexBytes && again.fragmentOutputs == plan.fragmentOutputs && again.shaderStages == plan.shaderStages && again.meshGroups == plan.meshGroups && again.meshLayers == plan.meshLayers && again.meshLayerStride == plan.meshLayerStride && again.candidate == plan.candidate && again.keyed == plan.keyed && again.contentKey == plan.contentKey && std::ranges::equal(repeated.bindings, layout.bindings, sameBinding) && std::ranges::equal(repeated.attributes, layout.attributes, sameAttribute), "APS5_VERIFY_DRAW_PLAN: the plan built after the draw's record-time work differs from the plan the draw used");
 }
 
-DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawPlan& drawPlan, DrawTimer& timer, PerformanceTimer& timing) {
+DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawPlan& drawPlan, DrawTimer& timer, PerformanceTimer& timing, const std::function<bool()>& deviceCurrent) {
     DrawInputs inputs;
     const auto reads = draw.indirect ? std::numeric_limits<std::uint64_t>::max() : static_cast<std::uint64_t>(draw.indexCount) * draw.instanceCount;
     inputs.indexBytes = drawPlan.indexBytes;
@@ -2059,6 +2060,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto use = draw.indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
         const bool restartTable = skipRestart && state.stages.mesh && (state.stages.mesh->inputPrimitive == 5 || state.stages.mesh->inputPrimitive == 6);
         const auto* behindWriter = InPlaceIndexBehindWriter(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, static_cast<bool>(state.stages.mesh), skipRestart, draw.firstVertex);
+        if (behindWriter == nullptr && deviceCurrent && !draw.indirect && !Recorder::FlushDrawIndices(context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), deviceCurrent)) {
+            inputs.recorderLost = true;
+            return inputs;
+        }
         const auto* import = behindWriter != nullptr ? behindWriter : InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, nullptr, static_cast<std::size_t>(indexBytes), reads);
         DrawInputCopy copy;
         if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use, 0, !BindsIndexCopy(state));
@@ -4073,7 +4078,7 @@ const char* targetObligation(const Context& context, const State& state, std::sp
     return repeatedDepth ? DepthTargetObligation(context, *state.depth, state.depthWrite) : nullptr;
 }
 
-bool prepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, PreparedDraw& prepared) {
+bool prepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, PreparedDraw& prepared, const std::function<bool()>& deviceCurrent) {
     auto*& recipeOut = prepared.recipeOut;
     auto& stencilReferences = prepared.stencilReferences;
     for (const auto& shader : shaders) {
@@ -4121,7 +4126,8 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto& inputs = prepared.inputs;
     const auto plan = planDraw(context, state, draw, shaders, nullptr, outcome, timer, prepared.contentKey);
     if (plan.nothing) return false;
-    inputs = prepareDrawInputs(context, state, draw, shaders, plan, timer, timing);
+    inputs = prepareDrawInputs(context, state, draw, shaders, plan, timer, timing, deviceCurrent);
+    if (inputs.recorderLost) return false;
     if (inputs.nothing) {
         if (VerifyDrawPlan()) requireDrawPlanRepeats(context, state, draw, shaders, plan);
         return false;
@@ -5089,11 +5095,11 @@ std::vector<std::uint32_t> DrawResourceContentKey(const Context& context, const 
     return DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape, const std::vector<std::uint32_t>* contentKey) {
+DrawResult Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape, const std::vector<std::uint32_t>* contentKey, const std::function<bool()>& deviceCurrent) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (state.stages.tessellationGeometry) {
         drawTessellationGeometry(context, state, draw, shaders, snapshots, trace);
-        return;
+        return DrawResult::Completed;
     }
     if (state.stages.mesh && state.layerExports != 0u && state.renderLayers > context.meshLimits.maxMeshOutputLayers && (draw.indirect || (draw.indexCount != 0u && draw.instanceCount != 0u))) {
         const auto limit = context.meshLimits.maxMeshOutputLayers;
@@ -5115,7 +5121,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             Draw(context, window, draw, shaders, snapshots, nullptr, trace);
             base += window.renderLayers;
         }
-        return;
+        return DrawResult::Completed;
     }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PreparedDraw prepared(profile);
@@ -5135,16 +5141,18 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         }
     } heldSpace{prepared};
     try {
-        if (prepareDraw(context, state, draw, shaders, snapshots, prepared)) recordPreparedDraw(context, state, draw, shaders, prepared);
+        if (prepareDraw(context, state, draw, shaders, snapshots, prepared, deviceCurrent)) recordPreparedDraw(context, state, draw, shaders, prepared);
+        if (prepared.inputs.recorderLost) return DrawResult::RecorderLost;
     } catch (...) {
         ThreadTargetMemo().Invalidate();
         keepHeldSpace(prepared);
         throw;
     }
     keepHeldSpace(prepared);
+    return DrawResult::Completed;
 }
 
-DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace) {
+DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace, const std::function<bool()>& deviceCurrent) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     static_cast<void>(snapshots);
@@ -5175,7 +5183,8 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     const auto plan = planDraw(context, state, draw, shaders, &recipe, outcome, timer);
     DrawInputs inputs;
     if (plan.nothing) inputs.nothing = true;
-    else inputs = prepareDrawInputs(context, state, draw, shaders, plan, timer, timing);
+    else inputs = prepareDrawInputs(context, state, draw, shaders, plan, timer, timing, deviceCurrent);
+    if (inputs.recorderLost) return miss(DrawRecipeMiss::RecorderLost);
     if (inputs.nothing) {
         result.recorded = true;
         return result;
